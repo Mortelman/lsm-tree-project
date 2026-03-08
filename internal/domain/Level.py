@@ -58,8 +58,6 @@ class Level:
                 return (True, value)
             
             if key in table.bloom:
-                # 1. tombstone
-                # 2. FP from bloom filter
                 pass
         return (False, None)
 
@@ -90,7 +88,6 @@ class Level:
                 pass
 
     def get_all_data(self) -> Iterator[Tuple[str, Optional[str]]]:
-        # DONE: написал k-way merge, чтобы не выгружать всё в RAM
         if not self.tables:
             return iter([])
         
