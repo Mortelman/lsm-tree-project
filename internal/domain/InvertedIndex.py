@@ -1,9 +1,11 @@
 import pickle
 import re
+from datetime import datetime
 from typing import List, Dict, Set, Optional, Tuple
 from pyroaring import BitMap
 from .TextPreprocessor import TextPreprocessor
 from .LSMTree import LSMTree
+from .DateIndex import DateIndex
 
 
 class InvertedIndex:
@@ -12,10 +14,12 @@ class InvertedIndex:
         self,
         preprocessor: Optional[TextPreprocessor] = None,
         use_lsm: bool = True,
-        lsm_data_dir: str = "./inverted_index_data"
+        lsm_data_dir: str = "./inverted_index_data",
+        enable_date_index: bool = False
     ):
         self.preprocessor = preprocessor or TextPreprocessor()
         self.use_lsm = use_lsm
+        self.enable_date_index = enable_date_index
         
         self.index: Dict[str, BitMap] = {}
         self.documents: Dict[int, str] = {}
@@ -23,6 +27,15 @@ class InvertedIndex:
         
         self.kgram_index: Dict[str, Set[str]] = {}
         self.k: int = 2
+        
+        if enable_date_index:
+            self.created_at_index: Optional[DateIndex] = DateIndex()
+            self.start_date_index: Optional[DateIndex] = DateIndex()
+            self.end_date_index: Optional[DateIndex] = DateIndex()
+        else:
+            self.created_at_index = None
+            self.start_date_index = None
+            self.end_date_index = None
         
         if use_lsm:
             self.lsm = LSMTree(
@@ -34,7 +47,14 @@ class InvertedIndex:
         else:
             self.lsm = None
     
-    def add_document(self, text: str, doc_id: Optional[int] = None) -> int:
+    def add_document(
+        self,
+        text: str,
+        doc_id: Optional[int] = None,
+        created_at: Optional[datetime] = None,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None
+    ) -> int:
         if doc_id is None:
             doc_id = self.next_doc_id
             self.next_doc_id += 1
@@ -50,6 +70,14 @@ class InvertedIndex:
                 self.index[token] = BitMap()
                 self._add_to_kgram_index(token)
             self.index[token].add(doc_id)
+        
+        if self.enable_date_index:
+            if created_at is not None and self.created_at_index is not None:
+                self.created_at_index.add(doc_id, created_at)
+            if start_date is not None and self.start_date_index is not None:
+                self.start_date_index.add(doc_id, start_date)
+            if self.end_date_index is not None:
+                self.end_date_index.add(doc_id, end_date)
         
         if self.use_lsm:
             self._persist_document(doc_id, text, tokens)
@@ -124,11 +152,17 @@ class InvertedIndex:
     def _parse_boolean_query(self, query: str) -> BitMap:
         query = query.strip()
         
+        if query.startswith('__DATE_RESULT_') and hasattr(self, '_temp_results'):
+            return self._temp_results.get(query, BitMap())
+        
         if query.startswith('(') and query.endswith(')'):
             return self._parse_boolean_query(query[1:-1])
         
         if query.upper().startswith('NOT '):
             term = query[4:].strip()
+            if term.startswith('__DATE_RESULT_') and hasattr(self, '_temp_results'):
+                all_docs = BitMap(range(self.next_doc_id))
+                return all_docs - self._temp_results.get(term, BitMap())
             return self.search_not(term)
         
         if ' AND ' in query.upper():
@@ -332,3 +366,130 @@ class InvertedIndex:
                     result |= BitMap.deserialize(serialized.encode('latin1'))
         
         return result
+    
+    # Методы для работы с датами
+    
+    def search_date_range(
+        self, 
+        start: datetime, 
+        end: datetime,
+        date_field: str = 'created_at'
+    ) -> BitMap:
+        if not self.enable_date_index:
+            raise ValueError("Date index is not enabled. Set enable_date_index=True in constructor.") 
+        if date_field == 'created_at':
+            if self.created_at_index is None:
+                return BitMap()
+            return self.created_at_index.search_range(start, end)
+        elif date_field == 'start_date':
+            if self.start_date_index is None:
+                return BitMap()
+            return self.start_date_index.search_range(start, end)
+        elif date_field == 'end_date':
+            if self.end_date_index is None:
+                return BitMap()
+            return self.end_date_index.search_range(start, end)
+        else:
+            raise ValueError(f"Unknown date field: {date_field}")
+    
+    def search_valid_in_range(
+        self, 
+        query_start: datetime, 
+        query_end: datetime
+    ) -> BitMap:
+        if not self.enable_date_index:
+            raise ValueError("Date index is not enabled. Set enable_date_index=True in constructor.")
+        
+        if self.start_date_index is None or self.end_date_index is None:
+            return BitMap()
+        
+        condition1 = self.start_date_index.search_before(query_end, inclusive=True)
+        null_docs = self.end_date_index.search_null()
+        not_ended = self.end_date_index.search_after(query_start, inclusive=True)
+        condition2 = null_docs | not_ended
+
+        return condition1 & condition2
+    
+    def search_appeared_in_range(
+        self, 
+        query_start: datetime, 
+        query_end: datetime
+    ) -> BitMap:
+        if not self.enable_date_index:
+            raise ValueError("Date index is not enabled. Set enable_date_index=True in constructor.")
+        
+        if self.start_date_index is None:
+            return BitMap()
+        
+        return self.start_date_index.search_range(query_start, query_end)
+    
+    def search_boolean_with_dates(self, query: str) -> BitMap:
+        if not self.enable_date_index:
+            raise ValueError("Date index is not enabled. Set enable_date_index=True in constructor.")
+        
+        query = self._parse_date_functions(query)
+        
+        return self._parse_boolean_query(query)
+    
+    def _parse_date_functions(self, query: str) -> str:
+        import re
+        
+        date_range_pattern = r'date_range\((\w+),\s*([^,]+),\s*([^)]+)\)'
+        
+        def replace_date_range(match):
+            field = match.group(1)
+            start_str = match.group(2).strip()
+            end_str = match.group(3).strip()
+            
+            start = datetime.fromisoformat(start_str)
+            end = datetime.fromisoformat(end_str)
+            
+            result = self.search_date_range(start, end, field)
+            
+            token = f"__DATE_RESULT_{id(result)}__"
+            self._temp_results = getattr(self, '_temp_results', {})
+            self._temp_results[token] = result
+            
+            return token
+        
+        query = re.sub(date_range_pattern, replace_date_range, query)
+        
+        valid_in_pattern = r'valid_in\(([^,]+),\s*([^)]+)\)'
+        
+        def replace_valid_in(match):
+            start_str = match.group(1).strip()
+            end_str = match.group(2).strip()
+            
+            start = datetime.fromisoformat(start_str)
+            end = datetime.fromisoformat(end_str)
+            
+            result = self.search_valid_in_range(start, end)
+            
+            token = f"__DATE_RESULT_{id(result)}__"
+            self._temp_results = getattr(self, '_temp_results', {})
+            self._temp_results[token] = result
+            
+            return token
+        
+        query = re.sub(valid_in_pattern, replace_valid_in, query)
+        
+        appeared_in_pattern = r'appeared_in\(([^,]+),\s*([^)]+)\)'
+        
+        def replace_appeared_in(match):
+            start_str = match.group(1).strip()
+            end_str = match.group(2).strip()
+            
+            start = datetime.fromisoformat(start_str)
+            end = datetime.fromisoformat(end_str)
+            
+            result = self.search_appeared_in_range(start, end)
+            
+            token = f"__DATE_RESULT_{id(result)}__"
+            self._temp_results = getattr(self, '_temp_results', {})
+            self._temp_results[token] = result
+            
+            return token
+        
+        query = re.sub(appeared_in_pattern, replace_appeared_in, query)
+        
+        return query
